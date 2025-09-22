@@ -1,0 +1,48 @@
+name: Build v2.3.9 BPF Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v2.3.9"
+
+jobs:
+  build-sbf-artifacts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code at v2.3.9
+        uses: actions/checkout@v4
+        with:
+          ref: v2.3.9
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.86.0
+
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Install platform tools
+        run: |
+          cargo install --git https://github.com/anza-xyz/agave.git --tag v2.3.9 solana-cargo-build-sbf
+
+      - name: Build stake program
+        run: |
+          cargo-build-sbf --manifest-path programs/stake/Cargo.toml -- --locked
+
+      - name: Build vote program
+        run: |
+          cargo-build-sbf --manifest-path programs/vote/Cargo.toml -- --locked
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-bpf-programs-v2.3.9
+          path: |
+            target/deploy/solana_stake_program.so
+            target/deploy/solana_vote_program.so
+          retention-days: 30
