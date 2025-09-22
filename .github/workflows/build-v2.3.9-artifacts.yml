@@ -13,10 +13,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code at v2.3.9
-        uses: actions/checkout@v4
-        with:
-          ref: v2.3.9
+          - name: Checkout code at v2.3.9
+      uses: actions/checkout@v4
+      with:
+        repository: anza-xyz/agave
+        ref: v2.3.9
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
