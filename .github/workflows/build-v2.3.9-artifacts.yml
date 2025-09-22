@@ -3,6 +3,8 @@ name: Build v2.3.9 BPF Artifacts
 on:
   workflow_dispatch:
   push:
+    branches:
+      - "my-branch-from-v2.3.9"
     tags:
       - "v2.3.9"
 
