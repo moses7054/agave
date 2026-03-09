@@ -129,6 +129,19 @@ use {
         send_transaction_service::SendTransactionService, test_utils::ClientWithCreator,
     },
 };
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+use {
+    solana_gossip::contact_info::ContactInfo,
+    solana_ledger::get_tmp_ledger_path,
+    solana_net_utils::SocketAddrSpace,
+    solana_runtime::commitment::CommitmentSlots,
+    solana_send_transaction_service::{
+        send_transaction_service::{
+            Config as SendTransactionServiceConfig, SendTransactionService,
+        },
+        test_utils::ClientWithCreator,
+    },
+};
 
 mod transaction {
     pub use solana_transaction_error::TransactionResult as Result;
@@ -139,6 +152,7 @@ pub mod account_resolver;
 type RpcCustomResult<T> = std::result::Result<T, RpcCustomError>;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
+pub const MAX_RESPONSE_BODY_SIZE: usize = 200 * (1 << 20); // 200MB for large responses
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
@@ -444,7 +458,7 @@ impl JsonRpcRequestProcessor {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
     pub fn new_from_bank<Client: ClientWithCreator>(
         bank: Bank,
         socket_addr_space: SocketAddrSpace,

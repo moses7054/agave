@@ -1259,7 +1259,7 @@ impl Validator {
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
                 rpc_tpu_client_args,
             };
-            let json_rpc_service =
+            let json_rpc_service: JsonRpcService =
                 JsonRpcService::new_with_config(rpc_svc_config).map_err(ValidatorError::Other)?;
             let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
                 exit.clone(),

@@ -14,11 +14,6 @@ use {
         snapshot_config::SnapshotConfig, SnapshotInterval,
     },
     crossbeam_channel::unbounded,
-    jsonrpc_core::{futures::prelude::*, MetaIoHandler},
-    jsonrpc_http_server::{
-        hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
-        RequestMiddlewareAction, ServerBuilder,
-    },
     regex::Regex,
     solana_cli_output::display::build_balance_message,
     solana_client::connection_cache::Protocol,
@@ -55,9 +50,27 @@ use {
             Arc, RwLock,
         },
         task::{Context, Poll},
-        thread::{self, Builder, JoinHandle},
+        thread,
         time::{Duration, Instant},
     },
+};
+
+#[cfg(not(feature = "use-jsonrpsee"))]
+use {
+    jsonrpc_core::{futures::prelude::*, MetaIoHandler},
+    jsonrpc_http_server::{
+        hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
+        RequestMiddlewareAction, ServerBuilder,
+    },
+    std::thread::{Builder, JoinHandle},
+};
+
+use futures::Stream;
+
+#[cfg(feature = "use-jsonrpsee")]
+use crate::rpc_service_jsonrpsee::start_jsonrpsee_server;
+
+use {
     tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
     tokio_util::{
         bytes::Bytes,
@@ -113,16 +126,25 @@ where
 }
 
 pub struct JsonRpcService {
+    #[cfg(not(feature = "use-jsonrpsee"))]
     thread_hdl: JoinHandle<()>,
+
+    #[cfg(feature = "use-jsonrpsee")]
+    thread_hdl: tokio::task::JoinHandle<()>,
 
     #[cfg(test)]
     pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
 
+    #[cfg(not(feature = "use-jsonrpsee"))]
     close_handle: Option<CloseHandle>,
+
+    #[cfg(feature = "use-jsonrpsee")]
+    close_handle: Option<jsonrpsee::server::ServerHandle>,
 
     client_updater: Arc<dyn NotifyKeyUpdate + Send + Sync>,
 }
 
+#[cfg(not(feature = "use-jsonrpsee"))]
 struct RpcRequestMiddleware {
     ledger_path: PathBuf,
     full_snapshot_archive_path_regex: Regex,
@@ -132,6 +154,7 @@ struct RpcRequestMiddleware {
     health: Arc<RpcHealth>,
 }
 
+#[cfg(not(feature = "use-jsonrpsee"))]
 impl RpcRequestMiddleware {
     pub fn new(
         ledger_path: PathBuf,
@@ -339,6 +362,7 @@ impl RpcRequestMiddleware {
     }
 }
 
+#[cfg(not(feature = "use-jsonrpsee"))]
 impl RequestMiddleware for RpcRequestMiddleware {
     fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
         trace!("request uri: {}", request.uri());
@@ -403,6 +427,7 @@ impl RequestMiddleware for RpcRequestMiddleware {
     }
 }
 
+#[cfg(not(feature = "use-jsonrpsee"))]
 fn match_supply_path(path: &str) -> Option<&str> {
     match path {
         "/v0/circulating-supply" | "/v0/total-supply" => Some(path),
@@ -415,6 +440,7 @@ pub enum SupplyCalcError {
     Scan(String),
 }
 
+#[cfg(not(feature = "use-jsonrpsee"))]
 async fn calculate_circulating_supply_async(bank: &Arc<Bank>) -> Result<u64, SupplyCalcError> {
     let total_supply = bank.capitalization();
     let bank = Arc::clone(bank);
@@ -427,6 +453,7 @@ async fn calculate_circulating_supply_async(bank: &Arc<Bank>) -> Result<u64, Sup
     Ok(total_supply.saturating_sub(non_circulating_supply.lamports))
 }
 
+#[cfg(not(feature = "use-jsonrpsee"))]
 async fn handle_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> Option<String> {
     match path {
         "/v0/circulating-supply" => {
@@ -446,6 +473,7 @@ async fn handle_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> Option<
     }
 }
 
+#[cfg(not(feature = "use-jsonrpsee"))]
 fn process_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> RequestMiddlewareAction {
     let bank_forks = bank_forks.clone();
     let path = path.to_string();
@@ -554,6 +582,83 @@ impl JsonRpcService {
             runtime,
         )?;
         Ok(json_rpc_service)
+    }
+
+    /// Create a new JsonRpcService using jsonrpsee (experimental)
+    ///
+    /// This is an alternative constructor that uses jsonrpsee instead of jsonrpc-core.
+    /// It demonstrates the migration path and can be enabled via configuration.
+    #[cfg(feature = "use-jsonrpsee")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_jsonrpsee<
+        Client: TransactionClient
+            + NotifyKeyUpdate
+            + Clone
+            + std::marker::Send
+            + std::marker::Sync
+            + 'static,
+    >(
+        rpc_addr: SocketAddr,
+        config: JsonRpcConfig,
+        request_processor: JsonRpcRequestProcessor,
+        client: Client,
+        runtime: Arc<TokioRuntime>,
+    ) -> Result<Self, String> {
+        use crate::rpc_service_jsonrpsee::start_jsonrpsee_server;
+
+        info!("rpc bound to {rpc_addr:?} (using jsonrpsee)");
+        info!("rpc configuration: {config:?}");
+
+        let max_request_body_size = config
+            .max_request_body_size
+            .unwrap_or(crate::rpc::MAX_REQUEST_BODY_SIZE)
+            as u32;
+        let rpc_niceness_adj = config.rpc_niceness_adj;
+
+        let max_response_body_size = crate::rpc::MAX_RESPONSE_BODY_SIZE as u32;
+
+        #[cfg(test)]
+        let test_request_processor = request_processor.clone();
+
+        let runtime_for_block_on = runtime.clone();
+        let processor_clone = request_processor.clone();
+        let (close_handle_sender, close_handle_receiver) =
+            unbounded::<Result<jsonrpsee::server::ServerHandle, String>>();
+
+        let thread_hdl = runtime.spawn_blocking(move || {
+            runtime_for_block_on.block_on(async move {
+                renice_this_thread(rpc_niceness_adj).unwrap();
+
+                match start_jsonrpsee_server(
+                    rpc_addr,
+                    processor_clone,
+                    max_request_body_size,
+                    max_response_body_size,
+                )
+                .await
+                {
+                    Ok(server_handle) => {
+                        info!("jsonrpsee RPC server started successfully");
+                        let _ = close_handle_sender.send(Ok(server_handle.clone()));
+                        server_handle.stopped().await;
+                    }
+                    Err(e) => {
+                        warn!("JSON RPC service unavailable error: {:?}", e);
+                        let _ = close_handle_sender.send(Err(e.to_string()));
+                    }
+                }
+            });
+        });
+
+        let close_handle = close_handle_receiver.recv().unwrap().map_err(|e| e)?;
+
+        Ok(Self {
+            thread_hdl,
+            #[cfg(test)]
+            request_processor: test_request_processor,
+            close_handle: Some(close_handle),
+            client_updater: Arc::new(client) as Arc<dyn NotifyKeyUpdate + Send + Sync>,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -691,92 +796,167 @@ impl JsonRpcService {
 
         let ledger_path = ledger_path.to_path_buf();
 
-        let (close_handle_sender, close_handle_receiver) = unbounded();
-        let thread_hdl = Builder::new()
-            .name("solJsonRpcSvc".to_string())
-            .spawn(move || {
+        #[cfg(not(feature = "use-jsonrpsee"))]
+        {
+            let (close_handle_sender, close_handle_receiver) =
+                unbounded::<Result<CloseHandle, String>>();
+            let thread_hdl = Builder::new()
+                .name("solJsonRpcSvc".to_string())
+                .spawn(move || {
+                    renice_this_thread(rpc_niceness_adj).unwrap();
+
+                    let mut io = MetaIoHandler::default();
+
+                    io.extend_with(rpc_minimal::MinimalImpl.to_delegate());
+                    if full_api {
+                        io.extend_with(rpc_bank::BankDataImpl.to_delegate());
+                        io.extend_with(rpc_accounts::AccountsDataImpl.to_delegate());
+                        io.extend_with(rpc_accounts_scan::AccountsScanImpl.to_delegate());
+                        io.extend_with(rpc_full::FullImpl.to_delegate());
+                    }
+
+                    let request_middleware = RpcRequestMiddleware::new(
+                        ledger_path,
+                        snapshot_config,
+                        bank_forks.clone(),
+                        health.clone(),
+                    );
+                    let server = ServerBuilder::with_meta_extractor(
+                        io,
+                        move |req: &hyper::Request<hyper::Body>| {
+                            let xbigtable = req.headers().get("x-bigtable");
+                            if xbigtable.is_some_and(|v| v == "disabled") {
+                                request_processor.clone_without_bigtable()
+                            } else {
+                                request_processor.clone()
+                            }
+                        },
+                    )
+                    .event_loop_executor(runtime.handle().clone())
+                    .threads(1)
+                    .cors(DomainsValidation::AllowOnly(vec![
+                        AccessControlAllowOrigin::Any,
+                    ]))
+                    .cors_max_age(86400)
+                    .request_middleware(request_middleware)
+                    .max_request_body_size(max_request_body_size)
+                    .start_http(&rpc_addr);
+
+                    if let Err(e) = server {
+                        warn!(
+                            "JSON RPC service unavailable error: {e:?}. Also, check that port {} is \
+                             not already in use by another application",
+                            rpc_addr.port()
+                        );
+                        close_handle_sender.send(Err(e.to_string())).unwrap();
+                        return;
+                    }
+
+                    let server = server.unwrap();
+                    close_handle_sender.send(Ok(server.close_handle())).unwrap();
+                    server.wait();
+                    exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
+                })
+                .unwrap();
+
+            let close_handle = close_handle_receiver.recv().unwrap()?;
+            let close_handle_ = close_handle.clone();
+            validator_exit
+                .write()
+                .unwrap()
+                .register_exit(Box::new(move || {
+                    close_handle_.close();
+                }));
+            Ok(Self {
+                thread_hdl,
+                #[cfg(test)]
+                request_processor: test_request_processor,
+                close_handle: Some(close_handle),
+                client_updater: Arc::new(client) as Arc<dyn NotifyKeyUpdate + Send + Sync>,
+            })
+        }
+
+        #[cfg(feature = "use-jsonrpsee")]
+        {
+            let (close_handle_sender, close_handle_receiver) =
+                unbounded::<Result<jsonrpsee::server::ServerHandle, String>>();
+            info!(" Starting RPC server with jsonrpsee (experimental)");
+
+            let server_task = runtime.spawn(async move {
                 renice_this_thread(rpc_niceness_adj).unwrap();
 
-                let mut io = MetaIoHandler::default();
-
-                io.extend_with(rpc_minimal::MinimalImpl.to_delegate());
-                if full_api {
-                    io.extend_with(rpc_bank::BankDataImpl.to_delegate());
-                    io.extend_with(rpc_accounts::AccountsDataImpl.to_delegate());
-                    io.extend_with(rpc_accounts_scan::AccountsScanImpl.to_delegate());
-                    io.extend_with(rpc_full::FullImpl.to_delegate());
-                }
-
-                let request_middleware = RpcRequestMiddleware::new(
-                    ledger_path,
-                    snapshot_config,
-                    bank_forks.clone(),
-                    health.clone(),
-                );
-                let server = ServerBuilder::with_meta_extractor(
-                    io,
-                    move |req: &hyper::Request<hyper::Body>| {
-                        let xbigtable = req.headers().get("x-bigtable");
-                        if xbigtable.is_some_and(|v| v == "disabled") {
-                            request_processor.clone_without_bigtable()
-                        } else {
-                            request_processor.clone()
-                        }
-                    },
+                let server_handle = start_jsonrpsee_server(
+                    rpc_addr,
+                    request_processor,
+                    max_request_body_size as u32,
+                    crate::rpc::MAX_RESPONSE_BODY_SIZE as u32,
                 )
-                .event_loop_executor(runtime.handle().clone())
-                .threads(1)
-                .cors(DomainsValidation::AllowOnly(vec![
-                    AccessControlAllowOrigin::Any,
-                ]))
-                .cors_max_age(86400)
-                .request_middleware(request_middleware)
-                .max_request_body_size(max_request_body_size)
-                .start_http(&rpc_addr);
+                .await
+                .expect("Failed to start jsonrpsee RPC server");
 
-                if let Err(e) = server {
-                    warn!(
-                        "JSON RPC service unavailable error: {e:?}. Also, check that port {} is \
-                         not already in use by another application",
-                        rpc_addr.port()
-                    );
-                    close_handle_sender.send(Err(e.to_string())).unwrap();
-                    return;
-                }
+                info!(" jsonrpsee RPC server started on {}", rpc_addr);
 
-                let server = server.unwrap();
-                close_handle_sender.send(Ok(server.close_handle())).unwrap();
-                server.wait();
+                // Send handle back for shutdown
+                close_handle_sender.send(Ok(server_handle.clone())).unwrap();
+
+                // Wait for shutdown
+                server_handle.stopped().await;
                 exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
+            });
+
+            let close_handle = close_handle_receiver.recv().unwrap()?;
+            let close_handle_ = close_handle.clone();
+            validator_exit
+                .write()
+                .unwrap()
+                .register_exit(Box::new(move || {
+                    let _ = close_handle_.stop();
+                }));
+
+            Ok(Self {
+                thread_hdl: server_task,
+                #[cfg(test)]
+                request_processor: test_request_processor,
+                close_handle: Some(close_handle),
+                client_updater: Arc::new(client) as Arc<dyn NotifyKeyUpdate + Send + Sync>,
             })
-            .unwrap();
-
-        let close_handle = close_handle_receiver.recv().unwrap()?;
-        let close_handle_ = close_handle.clone();
-        validator_exit
-            .write()
-            .unwrap()
-            .register_exit(Box::new(move || {
-                close_handle_.close();
-            }));
-        Ok(Self {
-            thread_hdl,
-            #[cfg(test)]
-            request_processor: test_request_processor,
-            close_handle: Some(close_handle),
-            client_updater: Arc::new(client) as Arc<dyn NotifyKeyUpdate + Send + Sync>,
-        })
-    }
-
-    pub fn exit(&mut self) {
-        if let Some(c) = self.close_handle.take() {
-            c.close()
         }
     }
 
+    pub fn exit(&mut self) {
+        #[cfg(not(feature = "use-jsonrpsee"))]
+        {
+            if let Some(c) = self.close_handle.take() {
+                c.close()
+            }
+        }
+
+        #[cfg(feature = "use-jsonrpsee")]
+        {
+            if let Some(server_handle) = self.close_handle.take() {
+                let _ = server_handle.stop();
+            }
+        }
+    }
+
+    #[cfg(not(feature = "use-jsonrpsee"))]
     pub fn join(mut self) -> thread::Result<()> {
         self.exit();
         self.thread_hdl.join()
+    }
+
+    #[cfg(feature = "use-jsonrpsee")]
+    pub fn join(mut self) -> thread::Result<()> {
+        self.exit();
+        // For tokio::task::JoinHandle, we need to block on it
+        tokio::runtime::Handle::current()
+            .block_on(self.thread_hdl)
+            .map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )) as Box<dyn std::any::Any + Send>
+            })
     }
 
     pub fn get_client_key_updater(&self) -> Arc<dyn NotifyKeyUpdate + Send + Sync> {

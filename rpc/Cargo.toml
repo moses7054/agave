@@ -19,9 +19,11 @@ name = "solana_rpc"
 [features]
 agave-unstable-api = []
 dev-context-only-utils = [
+    "solana-net-utils",
     "solana-ledger/dev-context-only-utils",
     "solana-rpc/dev-context-only-utils",
 ]
+use-jsonrpsee = []
 
 [dependencies]
 agave-feature-set = { workspace = true }
@@ -31,12 +33,14 @@ bincode = { workspace = true }
 bs58 = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true }
+futures = { workspace = true }
 itertools = { workspace = true }
 jsonrpc-core = { workspace = true }
 jsonrpc-core-client = { workspace = true }
 jsonrpc-derive = { workspace = true }
 jsonrpc-http-server = { workspace = true }
 jsonrpc-pubsub = { workspace = true }
+jsonrpsee = { version = "0.26", features = ["server", "macros", "http-client"] }
 libc = { workspace = true }
 log = { workspace = true }
 rayon = { workspace = true }
@@ -65,6 +69,7 @@ solana-measure = { workspace = true }
 solana-message = { workspace = true }
 solana-metrics = { workspace = true }
 solana-native-token = { workspace = true }
+solana-net-utils = { workspace = true, optional = true }
 solana-perf = { workspace = true }
 solana-poh = { workspace = true }
 solana-poh-config = { workspace = true }
